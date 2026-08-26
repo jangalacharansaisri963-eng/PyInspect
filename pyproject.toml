@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyinspect"
+version = "5.0.0"
+description = "A zero-import Python project analyzer and CLI dashboard"
+readme = "README.md"
+authors = [
+    { name = "Dan Studios" }
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+pyinspect = "pyinspect.cli:main"
