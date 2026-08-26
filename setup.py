@@ -10,5 +10,5 @@ setup(
     version="5.0.0",
     packages=find_packages(),
     ext_modules=[c_extension],
-    zip-safe=False,
+    zip_safe=False,
 )
