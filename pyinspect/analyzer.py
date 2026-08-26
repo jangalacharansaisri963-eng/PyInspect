@@ -2,50 +2,55 @@ import os
 import ast
 from pathlib import Path
 
-class ASTAnalyzer(ast.NodeVisitor):
-    def __init__(self, filepath, rel_name):
-        self.filepath = filepath
+class V5ASTAnalyzer(ast.NodeVisitor):
+    """Deep AST Analyzer for v5: tracks metrics, scope, complexity, and smells."""
+    def __init__(self, filename: str, rel_name: str):
+        self.filename = filename
         self.rel_name = rel_name
-        self.functions = 0
-        self.classes = 0
-        self.imports = 0
+        self.metrics = {
+            "functions": 0,
+            "classes": 0,
+            "imports": 0,
+            "lines_of_code": 0,
+        }
         self.imported_names = set()
         self.used_names = set()
-        self.warnings = []
+        self.function_details = []
         self.function_complexities = {}
+        self.warnings = []
 
     def visit_Import(self, node):
-        self.imports += len(node.names)
+        self.metrics["imports"] += len(node.names)
         for alias in node.names:
             name = alias.asname or alias.name
             self.imported_names.add((name, node.lineno))
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
-        self.imports += len(node.names)
+        self.metrics["imports"] += len(node.names)
         for alias in node.names:
             name = alias.asname or alias.name
             self.imported_names.add((name, node.lineno))
         self.generic_visit(node)
 
     def visit_ClassDef(self, node):
-        self.classes += 1
+        self.metrics["classes"] += 1
+        if not ast.get_docstring(node) and not node.name.startswith('_'):
+            self.warnings.append(f"{self.rel_name}:{node.lineno} Class '{node.name}' has no docstring")
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node):
-        self.functions += 1
+        self.metrics["functions"] += 1
         
-        # Check function length
-        if node.end_lineno and node.lineno:
-            length = node.end_lineno - node.lineno
-            if length > 80:
-                self.warnings.append(f"{self.rel_name}: function {node.name}() is too long ({length} lines)")
+        func_length = (node.end_lineno - node.lineno) if (node.end_lineno and node.lineno) else 0
+        if func_length > 80:
+            self.warnings.append(f"{self.rel_name}:{node.lineno} Function '{node.name}()' is too long ({func_length} lines)")
 
-        # Check docstring
-        if not ast.get_docstring(node) and not node.name.startswith('_'):
-            self.warnings.append(f"{self.rel_name}: function {node.name}() has no docstring")
+        has_docstring = bool(ast.get_docstring(node))
+        if not has_docstring and not node.name.startswith('_'):
+            self.warnings.append(f"{self.rel_name}:{node.lineno} Function '{node.name}()' is missing a docstring")
 
-        # Calculate Cyclomatic Complexity (Base 1 + decision points)
+        # Cyclomatic Complexity calculation
         complexity = 1
         for child in ast.walk(node):
             if isinstance(child, (ast.If, ast.For, ast.While, ast.ExceptHandler, ast.With, ast.Assert, ast.comprehension)):
@@ -53,7 +58,16 @@ class ASTAnalyzer(ast.NodeVisitor):
             elif isinstance(child, ast.BoolOp):
                 complexity += len(child.values) - 1
 
-        self.function_complexities[f"{node.name}()"] = complexity
+        func_key = f"{node.name}()"
+        self.function_complexities[func_key] = complexity
+        self.function_details.append({
+            "name": func_key,
+            "line": node.lineno,
+            "length": func_length,
+            "complexity": complexity,
+            "has_docstring": has_docstring
+        })
+        
         self.generic_visit(node)
 
     def visit_Name(self, node):
@@ -97,19 +111,20 @@ def analyze_project(project_path: Path) -> dict:
         except Exception:
             continue
 
-        analyzer = ASTAnalyzer(file_path, str(rel_name))
+        analyzer = V5ASTAnalyzer(file_path.name, str(rel_name))
         analyzer.visit(tree)
+        analyzer.metrics["lines_of_code"] = len(content.splitlines())
 
-        total_functions += analyzer.functions
-        total_classes += analyzer.classes
-        total_imports += analyzer.imports
+        total_functions += analyzer.metrics["functions"]
+        total_classes += analyzer.metrics["classes"]
+        total_imports += analyzer.metrics["imports"]
         all_warnings.extend(analyzer.warnings)
 
         # Detect unused imports
         for imp_name, lineno in analyzer.imported_names:
-            base_imp = imp_name.split('.')[0]
-            if base_imp not in analyzer.used_names:
-                all_warnings.append(f"{rel_name}:{lineno} unused import '{imp_name}'")
+            base_name = imp_name.split('.')[0]
+            if base_name not in analyzer.used_names:
+                all_warnings.append(f"{rel_name}:{lineno} Unused import '{imp_name}'")
 
         for func_name, score in analyzer.function_complexities.items():
             all_complexities.append(score)
@@ -150,5 +165,5 @@ def analyze_project(project_path: Path) -> dict:
             "highest_func": highest_func,
             "highest_score": highest_score
         }
-            }
+    }
     
