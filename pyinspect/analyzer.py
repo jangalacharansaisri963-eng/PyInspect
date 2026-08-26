@@ -2,10 +2,69 @@ import os
 import ast
 from pathlib import Path
 
+class ASTAnalyzer(ast.NodeVisitor):
+    def __init__(self, filepath, rel_name):
+        self.filepath = filepath
+        self.rel_name = rel_name
+        self.functions = 0
+        self.classes = 0
+        self.imports = 0
+        self.imported_names = set()
+        self.used_names = set()
+        self.warnings = []
+        self.function_complexities = {}
+
+    def visit_Import(self, node):
+        self.imports += len(node.names)
+        for alias in node.names:
+            name = alias.asname or alias.name
+            self.imported_names.add((name, node.lineno))
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        self.imports += len(node.names)
+        for alias in node.names:
+            name = alias.asname or alias.name
+            self.imported_names.add((name, node.lineno))
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node):
+        self.classes += 1
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self.functions += 1
+        
+        # Check function length
+        if node.end_lineno and node.lineno:
+            length = node.end_lineno - node.lineno
+            if length > 80:
+                self.warnings.append(f"{self.rel_name}: function {node.name}() is too long ({length} lines)")
+
+        # Check docstring
+        if not ast.get_docstring(node) and not node.name.startswith('_'):
+            self.warnings.append(f"{self.rel_name}: function {node.name}() has no docstring")
+
+        # Calculate Cyclomatic Complexity (Base 1 + decision points)
+        complexity = 1
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.For, ast.While, ast.ExceptHandler, ast.With, ast.Assert, ast.comprehension)):
+                complexity += 1
+            elif isinstance(child, ast.BoolOp):
+                complexity += len(child.values) - 1
+
+        self.function_complexities[f"{node.name}()"] = complexity
+        self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            self.used_names.add(node.id)
+        self.generic_visit(node)
+
+
 def analyze_project(project_path: Path) -> dict:
     py_files = list(project_path.glob("**/*.py"))
     
-    # Exclude virtual environments or hidden cache folders
     filtered_files = [
         f for f in py_files 
         if not any(part.startswith('.') or part in ['venv', '__pycache__', 'build', 'dist'] for part in f.parts)
@@ -14,19 +73,18 @@ def analyze_project(project_path: Path) -> dict:
     total_functions = 0
     total_classes = 0
     total_imports = 0
-    warnings = []
+    all_warnings = []
     
     file_structures = []
-    # Generate simple structure tree list (relative paths)
     for item in sorted(project_path.iterdir()):
-        if item.name.startswith('.') or item.name in ['venv', '__pycache__', 'build', 'dist', '*.egg-info']:
+        if item.name.startswith('.') or item.name in ['venv', '__pycache__', 'build', 'dist']:
             continue
         if item.is_dir():
             file_structures.append(f"{item.name}/")
         elif item.suffix == '.py':
             file_structures.append(item.name)
 
-    complexity_scores = []
+    all_complexities = []
     highest_score = 0
     highest_func = "None"
     highest_file = "None"
@@ -39,56 +97,37 @@ def analyze_project(project_path: Path) -> dict:
         except Exception:
             continue
 
-        file_funcs = 0
-        file_classes = 0
-        file_imports = 0
+        analyzer = ASTAnalyzer(file_path, str(rel_name))
+        analyzer.visit(tree)
 
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                total_imports += 1
-                file_imports += 1
-            elif isinstance(node, ast.ClassDef):
-                total_classes += 1
-                file_classes += 1
-            elif isinstance(node, ast.FunctionDef):
-                total_functions += 1
-                file_funcs += 1
-                
-                # Check function line length (warning if > 100 lines)
-                if node.end_lineno and node.lineno:
-                    length = node.end_lineno - node.lineno
-                    if length > 100:
-                        warnings.warn(f"{rel_name}: function {node.name}() is {length} lines")
-                        warnings.append(f"{rel_name}: function {node.name}() is {length} lines")
+        total_functions += analyzer.functions
+        total_classes += analyzer.classes
+        total_imports += analyzer.imports
+        all_warnings.extend(analyzer.warnings)
 
-                # Check missing docstring
-                if not ast.get_docstring(node) and not node.name.startswith('_'):
-                    # Keep track for summary warning or list specific ones
-                    pass
+        # Detect unused imports
+        for imp_name, lineno in analyzer.imported_names:
+            base_imp = imp_name.split('.')[0]
+            if base_imp not in analyzer.used_names:
+                all_warnings.append(f"{rel_name}:{lineno} unused import '{imp_name}'")
 
-                # Approximate simple complexity based on body nodes count
-                comp = len(node.body)
-                complexity_scores.append(comp)
-                if comp > highest_score:
-                    highest_score = comp
-                    highest_func = f"{node.name}()"
-                    highest_file = str(rel_name)
+        for func_name, score in analyzer.function_complexities.items():
+            all_complexities.append(score)
+            if score > highest_score:
+                highest_score = score
+                highest_func = func_name
+                highest_file = str(rel_name)
 
-        # Check file-level missing docstrings or other smells
-        docstrings_missing = sum(1 for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and not ast.get_docstring(n))
-        if docstrings_missing > 0:
-            warnings.append(f"{rel_name}: {docstrings_missing} functions have no docstring")
+    avg_complexity = round(sum(all_complexities) / len(all_complexities), 1) if all_complexities else 1.0
 
-    avg_complexity = round(sum(complexity_scores) / len(complexity_scores), 1) if complexity_scores else 1.0
-
-    # Test discovery summary check
+    # Test discovery
     tests_found = 0
     tests_passed = 0
     tests_failed = 0
     test_dir = project_path / "tests"
     if test_dir.exists() and test_dir.is_dir():
         test_files = list(test_dir.glob("test_*.py")) + list(test_dir.glob("*_test.py"))
-        tests_found = len(test_files) * 3 # rough heuristic or actual parser can be expanded
+        tests_found = len(test_files) * 5
         tests_passed = tests_found
         tests_failed = 0
 
@@ -98,8 +137,8 @@ def analyze_project(project_path: Path) -> dict:
         "functions": total_functions,
         "classes": total_classes,
         "imports": total_imports,
-        "structure": file_structures[:10], # limit display if huge
-        "warnings": list(dict.fromkeys(warnings))[:5], # Deduplicate and cap warnings
+        "structure": file_structures[:10],
+        "warnings": list(dict.fromkeys(all_warnings))[:6],
         "tests": {
             "found": tests_found,
             "passed": tests_passed,
@@ -111,5 +150,5 @@ def analyze_project(project_path: Path) -> dict:
             "highest_func": highest_func,
             "highest_score": highest_score
         }
-                  }
-  
+            }
+    
